@@ -9,7 +9,9 @@ import os
 import posixpath
 import errno
 import stat
+import shutil
 import time
+import tempfile
 import subprocess
 from sandlib.killsubprocess import killsubprocess
 from sandlib.vfs import UID, GID, Dir, RealDir, RealFile, FSObject, File
@@ -574,12 +576,11 @@ class SimpleSandboxedProc(VirtualizedSandboxedProc, SimpleIOSandboxedProc):
     """
     libroot = os.path.join(os.path.dirname(__file__), '..', 'lib')
 
-    def __init__(self, sandbox_executable, script, script_name=None, script_args=None, extra=None):
+    def __init__(self, sandbox_executable, tempdir, script_name, script_args=None):
         script_args = list(script_args) if script_args else []
         self.executable = os.path.abspath(sandbox_executable)
-        self.script = script
-        self.script_name = script_name if script_name else os.path.basename(self.script)
-        self.extra = extra or {}
+        self.script_name = script_name
+        self.tempdir = tempdir
         self.returncode = None
         super(SimpleSandboxedProc, self).__init__(['/bin/pypy-c', self.script_name] + script_args, executable=self.executable)
 
@@ -594,21 +595,6 @@ class SimpleSandboxedProc(VirtualizedSandboxedProc, SimpleIOSandboxedProc):
         # * can access the temporary usession directory as /tmp
         exclude = ['.pyc', '.pyo']
 
-        if isinstance(self.script, FSObject):
-            tmp = {
-                self.script_name: self.script
-            }
-        else:
-            tmp = {
-                self.script_name: RealFile(self.script)
-            }
-        for key, value in self.extra.items():
-            if isinstance(value, FSObject):
-                tmp[key] = value
-            elif os.path.isdir(value):
-                tmp[key] = RealDir(value, exclude=exclude)
-            else:
-                tmp[key] = RealFile(value)
         return Dir({
             'bin': Dir({
                 'pypy-c': RealFile(self.executable),
@@ -617,7 +603,7 @@ class SimpleSandboxedProc(VirtualizedSandboxedProc, SimpleIOSandboxedProc):
                 'lib_pypy': RealDir(os.path.join(self.libroot, 'lib_pypy'),
                     exclude=exclude),
             }),
-            'tmp': Dir(tmp),
+            'tmp': RealDir(self.tempdir),
         })
 
 SIMPLE_SCRIPT = """import simplejson, sys, traceback
@@ -631,6 +617,8 @@ try:
 except:
     simplejson.dump({'error': True, 'data': traceback.format_exc()}, sys.__stdout__)
 """
+SIMPLE_SCRIPT_NAME = '__sandboxed__.py'
+SIMPLE_JSON = os.path.join(os.path.dirname(__file__), 'simplejson')
 
 def simple_call(sandbox_executable, script_path, func_name, args=None, kwargs=None, extra=None):
     """
@@ -644,17 +632,30 @@ def simple_call(sandbox_executable, script_path, func_name, args=None, kwargs=No
     @param extra: Extra files and folders to make available to the sandbox
     """
     module_name = os.path.splitext(os.path.basename(script_path))[0]
-    wrapper_script = File(SIMPLE_SCRIPT % {'module_name': module_name, 'func_name': func_name})
-    extra = extra or {}
-    extra['simplejson'] = RealDir(os.path.join(os.path.dirname(__file__), 'simplejson'))
-    extra[os.path.basename(script_path)] = RealFile(script_path)
-    proc = SimpleSandboxedProc(sandbox_executable, wrapper_script, script_name='__sandboxed__.py', extra=extra)
-    args = args or ()
-    kwargs = kwargs or {}
-    data = json.dumps({'args': args, 'kwargs': kwargs})
-    out, err = proc.communicate(data)
-    result = json.loads(out)
-    if result['error']:
-        raise Exception(result['data'])
-    else:
-        return result['data']
+    wrapper_script_content = SIMPLE_SCRIPT % {'module_name': module_name, 'func_name': func_name}
+
+    tempdir = tempfile.mkdtemp()
+    wrapper_script = os.path.join(tempdir, SIMPLE_SCRIPT_NAME)
+    try:
+        with open(wrapper_script, 'w') as fobj:
+            fobj.write(wrapper_script_content)
+        shutil.copytree(SIMPLE_JSON, os.path.join(tempdir, 'simplejson'))
+        if extra:
+            for key, value in extra.items():
+                target = os.path.join(tempdir, key.lstrip('/'))
+                if os.path.isdir(value):
+                    shutil.copytree(value, target)
+                else:
+                    shutil.copy(value, target)
+        proc = SimpleSandboxedProc(sandbox_executable, tempdir, SIMPLE_SCRIPT_NAME)
+        args = args or ()
+        kwargs = kwargs or {}
+        data = json.dumps({'args': args, 'kwargs': kwargs})
+        out, err = proc.communicate(data)
+        result = json.loads(out)
+        if result['error']:
+            raise Exception(result['data'])
+        else:
+            return result['data']
+    finally:
+        shutil.rmtree(tempdir)
